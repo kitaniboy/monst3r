@@ -7,11 +7,27 @@
 from copy import copy, deepcopy
 import torch
 import torch.nn as nn
+from einops import einsum, rearrange, repeat
 
 from dust3r.inference import get_pred_pts3d, find_opt_scaling
 from dust3r.utils.geometry import inv, geotrf, normalize_pointcloud
 from dust3r.utils.geometry import get_joint_pointcloud_depth, get_joint_pointcloud_center_scale
 
+# from lpips import LPIPS
+
+def convert_to_buffer(module: nn.Module, persistent: bool = True):
+    # Recurse over child modules.
+    for name, child in list(module.named_children()):
+        convert_to_buffer(child, persistent)
+
+    # Also re-save buffers to change persistence.
+    for name, parameter_or_buffer in (
+        *module.named_parameters(recurse=False),
+        *module.named_buffers(recurse=False),
+    ):
+        value = parameter_or_buffer.detach().clone()
+        delattr(module, name)
+        module.register_buffer(name, value, persistent=persistent)
 
 def Sum(*losses_and_masks):
     loss, mask = losses_and_masks[0]
@@ -26,9 +42,10 @@ def Sum(*losses_and_masks):
 
 
 class BaseCriterion(nn.Module):
-    def __init__(self, reduction='mean'):
+    def __init__(self, reduction='mean', dim=-1):
         super().__init__()
         self.reduction = reduction
+        self.dim = dim
 
 
 class LLoss (BaseCriterion):
@@ -36,7 +53,7 @@ class LLoss (BaseCriterion):
     """
 
     def forward(self, a, b):
-        assert a.shape == b.shape and a.ndim >= 2 and 1 <= a.shape[-1] <= 3, f'Bad shape = {a.shape}'
+        assert a.shape == b.shape, f'Bad shape = {a.shape} {b.shape}' #  and a.ndim >= 2 and 1 <= a.shape[-1] <= 3, f'Bad shape = {a.shape}'
         dist = self.distance(a, b)
         assert dist.ndim == a.ndim - 1  # one dimension less
         if self.reduction == 'none':
@@ -55,11 +72,17 @@ class L21Loss (LLoss):
     """ Euclidean distance between 3d points  """
 
     def distance(self, a, b):
-        return torch.norm(a - b, dim=-1)  # normalized L2 distance
+        return torch.norm(a - b, dim=self.dim)  # normalized L2 distance
+
+class MSELoss (LLoss):
+    """ Mean Squared Error """
+
+    def distance(self, a, b):
+        return (a - b).pow(2).mean(dim=self.dim)  # mean squared error
 
 
 L21 = L21Loss()
-
+# MSE = MSELoss()
 
 class Criterion (nn.Module):
     def __init__(self, criterion=None):
@@ -130,7 +153,6 @@ class MultiLoss (nn.Module):
         else:
             details = {}
         loss = loss * self._alpha
-
         if self._loss2:
             loss2, details2 = self._loss2(*args, **kwargs)
             loss = loss + loss2
@@ -138,6 +160,38 @@ class MultiLoss (nn.Module):
 
         return loss, details
 
+class ColorMSE (MultiLoss):
+    def __init__(self):
+        super().__init__()
+        self.mse = MSELoss(dim=1)
+        
+    def compute_loss(self, batch, pred):
+        pred_color = pred['color']
+        target = batch['rgb_target']
+        
+        mse = self.mse(pred_color, target.detach()).mean()
+        
+        return mse
+
+    def get_name(self):
+        return f'ColorMSE'
+
+class LPIPSLoss (MultiLoss):
+    def __init__(self):
+        super().__init__()
+        self.lpips = LPIPS(net="vgg")
+        convert_to_buffer(self.lpips, persistent=False)
+        
+    def compute_loss(self, batch, pred):
+        pred_color = pred['color']
+        target = batch['rgb_target']
+        
+        lpips = self.lpips.forward(pred_color, target.detach(), normalize=True).mean()
+
+        return lpips
+
+    def get_name(self):
+        return f'LPIPSLoss'
 
 class Regr3D (Criterion, MultiLoss):
     """ Ensure that all 3D points are correct.
@@ -156,23 +210,46 @@ class Regr3D (Criterion, MultiLoss):
         self.gt_scale = gt_scale
 
     def get_all_pts3d(self, gt1, gt2, pred1, pred2, dist_clip=None):
-        # everything is normalized w.r.t. camera of view1
-        in_camera1 = inv(gt1['camera_pose'])
-        gt_pts1 = geotrf(in_camera1, gt1['pts3d'])  # B,H,W,3
-        gt_pts2 = geotrf(in_camera1, gt2['pts3d'])  # B,H,W,3
+        with torch.no_grad():
+            camera_pose1 = gt1['camera_pose']
+            R1 = camera_pose1[:, :, :3, :3].reshape(-1, 3, 3)
+            T1 = camera_pose1[:, :, :3, 3].reshape(-1, 3)
+            
+            pts1 = gt1['pts3d']
+            H, W = pts1.shape[2:4]
+            pts1 = pts1.reshape(-1, H, W, 3)
+            
+            gt_pts1 = einsum(R1.transpose(-1, -2), (pts1 - T1[:, None, None]), 'b i j, b h w j -> b h w i')
+            
+            camera_pose2 = gt2['camera_pose']
+            R2 = camera_pose2[:, :, :3, :3].reshape(-1, 3, 3)
+            T2 = camera_pose2[:, :, :3, 3].reshape(-1, 3)
 
-        valid1 = gt1['valid_mask'].clone()
-        valid2 = gt2['valid_mask'].clone()
+            pts2 = gt2['pts3d']
+            pts2 = pts2.reshape(-1, H, W, 3)
+            gt_pts2 = einsum(R2.transpose(-1, -2), (pts2 - T2[:, None, None]), 'b i j, b h w j -> b h w i')
+        
+            valid1 = gt1['valid_mask'].reshape(-1, H, W).clone()
+            valid2 = gt2['valid_mask'].reshape(-1, H, W).clone()
 
-        if dist_clip is not None:
-            # points that are too far-away == invalid
-            dis1 = gt_pts1.norm(dim=-1)  # (B, H, W)
-            dis2 = gt_pts2.norm(dim=-1)  # (B, H, W)
-            valid1 = valid1 & (dis1 <= dist_clip)
-            valid2 = valid2 & (dis2 <= dist_clip)
+            if dist_clip is not None:
+                # points that are too far-away == invalid
+                dis1 = gt_pts1.norm(dim=-1)  # (B, H, W)
+                dis2 = gt_pts2.norm(dim=-1)  # (B, H, W)
+                valid1 = valid1 & (dis1 <= dist_clip)
+                valid2 = valid2 & (dis2 <= dist_clip)
 
-        pr_pts1 = get_pred_pts3d(gt1, pred1, use_pose=False)
-        pr_pts2 = get_pred_pts3d(gt2, pred2, use_pose=True)
+        # pr_pts1 = pred1['pts3d_context'].reshape(-1, H, W, 3)
+        # pr_pts2 = pred2['pts3d_target_in_context_view'].reshape(-1, H, W, 3)
+        pr_pts1 = pred1['pts3d'].reshape(-1, H, W, 3)
+        pr_pts2 = pred2['pts3d_in_other_view'].reshape(-1, H, W, 3)
+        
+        
+        pr_conf1 = pred1['conf'].reshape(-1, H, W)
+        pr_conf2 = pred2['conf'].reshape(-1, H, W)
+        
+        # pr_pts1 = get_pred_pts3d(gt1, pred1, use_pose=False)
+        # pr_pts2 = get_pred_pts3d(gt2, pred2, use_pose=True)
 
         # normalize 3d points
         if self.norm_mode:
@@ -180,18 +257,86 @@ class Regr3D (Criterion, MultiLoss):
         if self.norm_mode and not self.gt_scale:
             gt_pts1, gt_pts2 = normalize_pointcloud(gt_pts1, gt_pts2, self.norm_mode, valid1, valid2)
 
-        return gt_pts1, gt_pts2, pr_pts1, pr_pts2, valid1, valid2, {}
+        monitoring = {}
+
+        return gt_pts1, gt_pts2, pr_pts1, pr_pts2, valid1, valid2, pr_conf1, pr_conf2, monitoring
 
     def compute_loss(self, gt1, gt2, pred1, pred2, **kw):
-        gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, monitoring = \
+        gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring = \
             self.get_all_pts3d(gt1, gt2, pred1, pred2, **kw)
         # loss on img1 side
         l1 = self.criterion(pred_pts1[mask1], gt_pts1[mask1])
         # loss on gt2 side
         l2 = self.criterion(pred_pts2[mask2], gt_pts2[mask2])
+        
         self_name = type(self).__name__
-        details = {self_name + '_pts3d_1': float(l1.mean()), self_name + '_pts3d_2': float(l2.mean())}
-        return Sum((l1, mask1), (l2, mask2)), (details | monitoring)
+        loss_names = [self_name + '_pts3d_1', self_name + '_pts3d_2']
+        confidences = [pred_conf1, pred_conf2]
+        masks = [mask1, mask2]
+        losses = [l1, l2]
+        losses_mean = [float(l1.mean()), float(l2.mean())]
+
+        # ###########################
+        # gt_img1 = pred1['color_target']
+        # b, c, h, w = gt_img1.shape
+        # gt_img1 = gt_img1.permute(0, 2, 3, 1)
+
+        # pred_color1 = pred1['color'].permute(0, 2, 3, 1)
+        # color_loss = self.criterion(pred_color1, gt_img1)
+        
+        # self_name = type(self).__name__
+        # loss_names.append('color_loss')
+        # confidences.append(None)
+        # masks.append(None)
+        # losses.append(color_loss)
+        # losses_mean.append(float(color_loss.mean()))
+        # ###########################
+        
+        # pred_color_in_other_view1 = pred1['color_in_other_view'].permute(0, 2, 3, 1)
+        # reduction = self.criterion.reduction
+
+        # self.criterion.reduction = 'none'
+        # with torch.no_grad():
+        #     color_other_view_loss = self.criterion(pred_color_in_other_view1, gt_img1)
+        # self.criterion.reduction = reduction
+
+        # dy_conf = rearrange(pred1['rigidity'], '(b t) (h w) 1 -> (b t) h w', t=2, h=h, w=w)
+
+        # dy_conf_loss = self.criterion(dy_conf[..., None], color_other_view_loss[..., None].detach())
+
+
+        # self_name = type(self).__name__
+        # loss_names = (self_name + '_pts3d_1', self_name + '_pts3d_2', 'color_loss', 'dy_conf_loss')
+        # confidences = (pred1['conf'], pred2['conf'], None, None)
+        # masks = (mask1, mask2, None, None)
+        # losses = (l1, l2, color_loss, dy_conf_loss)
+        # losses_mean = (float(l1.mean()), float(l2.mean()), float(color_loss.mean()), float(dy_conf_loss.mean()))
+
+
+        ###########################
+        # pred_color_in_other_view1 = pred1['color_in_other_view'].permute(0, 2, 3, 1)
+        # color_other_view_loss = self.criterion(pred_color_in_other_view1, gt_img1)
+
+        # rigidity1 = rearrange(pred1['rigidity'], '(b t) (h w) 1 -> (b t) h w', t=2, h=h, w=w)
+        # dy_conf = rigidity1
+        
+
+        # self_name = type(self).__name__
+        # loss_names = (self_name + '_pts3d_1', self_name + '_pts3d_2', 'color_loss', 'color_other_view_loss')
+        # confidences = (pred1['conf'], pred2['conf'], None, dy_conf)
+        # masks = (mask1, mask2, None, None)
+        # losses = (l1, l2, color_loss, color_other_view_loss)
+        # losses_mean = (float(l1.mean()), float(l2.mean()), float(color_loss.mean()), float(color_other_view_loss.mean()))
+        ###########################
+
+        details = {}
+        for loss_name, loss in zip(loss_names, losses_mean):
+            details[loss_name] = loss
+        
+        details['loss_names'] = loss_names
+        details['confidences'] = confidences
+
+        return Sum(*zip(losses, masks)), (details | monitoring)
 
 
 class ConfLoss (MultiLoss):
@@ -219,24 +364,33 @@ class ConfLoss (MultiLoss):
 
     def compute_loss(self, gt1, gt2, pred1, pred2, **kw):
         # compute per-pixel loss
-        ((loss1, msk1), (loss2, msk2)), details = self.pixel_loss(gt1, gt2, pred1, pred2, **kw)
-        if loss1.numel() == 0:
-            print('NO VALID POINTS in img1', force=True)
-        if loss2.numel() == 0:
-            print('NO VALID POINTS in img2', force=True)
+        # ((loss1, msk1), (loss2, msk2)), details = self.pixel_loss(gt1, gt2, pred1, pred2, **kw)
+        losses_and_masks, details = self.pixel_loss(gt1, gt2, pred1, pred2, **kw)
 
-        # weight by confidence
-        conf1, log_conf1 = self.get_conf_log(pred1['conf'][msk1])
-        conf2, log_conf2 = self.get_conf_log(pred2['conf'][msk2])
-        conf_loss1 = loss1 * conf1 - self.alpha * log_conf1
-        conf_loss2 = loss2 * conf2 - self.alpha * log_conf2
+        loss_names = details.pop('loss_names')
+        confidences = details.pop('confidences')
+        
+        total_loss = 0.0
+        for (loss, mask), name, conf in zip(losses_and_masks, loss_names, confidences):
+            if loss.numel() == 0:
+                print(f'NO VALID POINTS in {name}', force=True)
+                
+            if conf is not None:
+                if mask is not None:
+                    conf = conf[mask]
 
-        # average + nan protection (in case of no valid pixels at all)
-        conf_loss1 = conf_loss1.mean() if conf_loss1.numel() > 0 else 0
-        conf_loss2 = conf_loss2.mean() if conf_loss2.numel() > 0 else 0
+                conf, log_conf = self.get_conf_log(conf)
 
-        return conf_loss1 + conf_loss2, dict(conf_loss_1=float(conf_loss1), conf_loss2=float(conf_loss2), **details)
+                loss = loss * conf - self.alpha * log_conf
+                loss = loss.mean() if loss.numel() > 0 else 0
+                
+                details[f'conf_{name}'] = float(conf.mean())
+            else:
+                loss = loss.mean() if loss.numel() > 0 else 0
+            
+            total_loss = total_loss + loss
 
+        return total_loss, details
 
 class Regr3D_ShiftInv (Regr3D):
     """ Same than Regr3D but invariant to depth shift.
@@ -244,7 +398,7 @@ class Regr3D_ShiftInv (Regr3D):
 
     def get_all_pts3d(self, gt1, gt2, pred1, pred2):
         # compute unnormalized points
-        gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, monitoring = \
+        gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring = \
             super().get_all_pts3d(gt1, gt2, pred1, pred2)
 
         # compute median depth
@@ -260,8 +414,7 @@ class Regr3D_ShiftInv (Regr3D):
         pred_z2 -= pred_shift_z
 
         # monitoring = dict(monitoring, gt_shift_z=gt_shift_z.mean().detach(), pred_shift_z=pred_shift_z.mean().detach())
-        return gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, monitoring
-
+        return gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring
 
 class Regr3D_ScaleInv (Regr3D):
     """ Same than Regr3D but invariant to depth shift.
@@ -270,7 +423,7 @@ class Regr3D_ScaleInv (Regr3D):
 
     def get_all_pts3d(self, gt1, gt2, pred1, pred2):
         # compute depth-normalized points
-        gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, monitoring = super().get_all_pts3d(gt1, gt2, pred1, pred2)
+        gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring = super().get_all_pts3d(gt1, gt2, pred1, pred2)
 
         # measure scene scale
         _, gt_scale = get_joint_pointcloud_center_scale(gt_pts1, gt_pts2, mask1, mask2)
@@ -291,9 +444,18 @@ class Regr3D_ScaleInv (Regr3D):
             pred_pts2 /= pred_scale
             # monitoring = dict(monitoring, gt_scale=gt_scale.mean(), pred_scale=pred_scale.mean().detach())
 
-        return gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, monitoring
+        return gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring
 
 
 class Regr3D_ScaleShiftInv (Regr3D_ScaleInv, Regr3D_ShiftInv):
     # calls Regr3D_ShiftInv first, then Regr3D_ScaleInv
-    pass
+    
+    def forward(self, *args, **kwargs):
+        loss, details = super().forward(*args, **kwargs)
+        
+        for key in list(details.keys()):
+            value = details[key]
+            if not isinstance(value, (float, int)):
+                details.pop(key)
+
+        return loss, details

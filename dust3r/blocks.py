@@ -16,6 +16,8 @@
 
 import torch
 import torch.nn as nn 
+from functools import partial
+import torch.nn.functional as F
 
 import itertools
 import collections.abc
@@ -25,6 +27,7 @@ from typing import Optional
 
 from torch.nn.attention.flex_attention import create_block_mask, flex_attention, BlockMask
 
+import croco.utils.misc as misc  # noqa
 
 def _ntuple(n):
     def parse(x):
@@ -96,7 +99,7 @@ class Attention(nn.Module):
         self.proj_drop = nn.Dropout(proj_drop)
         self.rope = rope
 
-    def forward(self, x, xpos):
+    def forward(self, x: torch.Tensor, xpos: torch.Tensor) -> torch.Tensor:
         B, N, C = x.shape
         
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads).transpose(1,3)
@@ -106,7 +109,8 @@ class Attention(nn.Module):
             _q = self.rope(_q, xpos)
             _k = self.rope(_k, xpos)
 
-        x = flex_attention(_q, _k, _v)
+        x = F.scaled_dot_product_attention(_q, _k, _v)
+        # x = flex_attention(_q, _k, _v)
 
         x = x.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
@@ -133,31 +137,26 @@ class CrossAttention(nn.Module):
         
     def forward(self,
                 query: torch.Tensor,
-                key: Optional[torch.Tensor] = None,
-                value: Optional[torch.Tensor] = None,
-                qpos: Optional[torch.Tensor] = None,
-                kpos: Optional[torch.Tensor] = None,
-                kv_cache: Optional[tuple[torch.Tensor]] = None,
-                score_mod=None):
+                key: torch.Tensor,
+                value: torch.Tensor,
+                qpos: torch.Tensor,
+                kpos: torch.Tensor) -> torch.Tensor:
         B, Nq, C = query.shape
         _q = self.projq(query).reshape(B,Nq,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
         
-        if kv_cache is not None:
-            _k, _v = kv_cache
-        else:
-            Nk = key.shape[1]
-            Nv = value.shape[1]
-            _k = self.projk(key).reshape(B,Nk,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
-            _v = self.projv(value).reshape(B,Nv,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        Nk = key.shape[1]
+        Nv = value.shape[1]
+        _k = self.projk(key).reshape(B,Nk,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        _v = self.projv(value).reshape(B,Nv,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
         
         if self.rope is not None:
             _q = self.rope(_q, qpos)
             _k = self.rope(_k, kpos)
             
-        if score_mod == 'causal':
-            def causal_mask(score, b, h, q_idx, kv_idx):
-                return torch.where(q_idx >= kv_idx, score, -float("inf"))
-            score_mod = causal_mask
+        # if score_mod == 'causal':
+        #     def causal_mask(score, b, h, q_idx, kv_idx):
+        #         return torch.where(q_idx >= kv_idx, score, -float("inf"))
+        #     score_mod = causal_mask
         
         # if score_mod is not None:
         #     # x = flex_attention(_q, _k, torch.ones_like(_v), score_mod=score_mod)
@@ -168,7 +167,64 @@ class CrossAttention(nn.Module):
         #     breakpoint()
         #     abc = 1
 
-        x = flex_attention(_q, _k, _v, score_mod=score_mod)
+        x = F.scaled_dot_product_attention(_q, _k, _v)
+        # x = flex_attention(_q, _k, _v)
+        
+        
+        x = x.transpose(1, 2).reshape(B, Nq, C)
+        x = self.proj(x)
+        x = self.proj_drop(x)
+        
+        return x
+
+class CrossAttentionWithMask(nn.Module):
+    
+    def __init__(self, dim, rope=None, num_heads=8, qkv_bias=False, attn_drop=0., proj_drop=0.):
+        super().__init__()
+        self.num_heads = num_heads
+        head_dim = dim // num_heads
+        self.scale = head_dim ** -0.5
+        
+        self.projq = nn.Linear(dim, dim, bias=qkv_bias)
+        self.projk = nn.Linear(dim, dim, bias=qkv_bias)
+        self.projv = nn.Linear(dim, dim, bias=qkv_bias)
+        # self.attn_drop = nn.Dropout(attn_drop)
+        self.proj = nn.Linear(dim, dim)
+        self.proj_drop = nn.Dropout(proj_drop)
+        
+        self.rope = rope
+        
+    def forward(self,
+                query: torch.Tensor,
+                key: torch.Tensor,
+                value: torch.Tensor,
+                qpos: torch.Tensor,
+                kpos: torch.Tensor,
+                attn_mask: torch.Tensor
+                # kv_cache: Optional[tuple[torch.Tensor]] = None
+                ):
+        B, Nq, C = query.shape
+        
+        _q = self.projq(query).reshape(B,Nq,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        
+        # if kv_cache is not None:
+        #     _k, _v = kv_cache
+        # else:
+        Nk = key.shape[1]
+        Nv = value.shape[1]
+        _k = self.projk(key).reshape(B,Nk,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        _v = self.projv(value).reshape(B,Nv,self.num_heads, C// self.num_heads).permute(0, 2, 1, 3)
+        
+        if self.rope is not None:
+            _q = self.rope(_q, qpos)
+            _k = self.rope(_k, kpos)
+        
+        x = F.scaled_dot_product_attention(_q, _k, _v, attn_mask=attn_mask)
+        
+        # _test = x.reshape(1, 5, -1, 12, 4, 64)
+        # if misc.get_rank() == 7:
+        #     breakpoint()
+        #     abc = 1
         
         x = x.transpose(1, 2).reshape(B, Nq, C)
         x = self.proj(x)
@@ -189,128 +245,6 @@ class LayerScale(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         return x.mul_(self.gamma) if self.inplace else x * self.gamma
-
-class DecoderBlock(nn.Module):
-
-    def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, norm_mem=True, rope_space=None, rope_time=None, return_xy=False):
-        super().__init__()
-        self.norm1 = norm_layer(dim)
-        self.attn = Attention(dim, rope=rope_space, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        
-        self.cross_attn = CrossAttention(dim, rope=rope_space, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
-        self.norm2 = norm_layer(dim)
-        self.norm_y = norm_layer(dim) if norm_mem else nn.Identity()
-
-        self.ls = LayerScale(dim)
-        self.norm_time = norm_layer(dim)
-        self.attn_time = CrossAttention(dim, rope=rope_time, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
-        
-        self.norm3 = norm_layer(dim)
-        mlp_hidden_dim = int(dim * mlp_ratio)
-        self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        
-        self.return_xy = return_xy
-        
-
-    def forward(self, x, y, xpos, ypos):
-        B, T1, T2, N = x.shape[:4]
-        
-        x = rearrange(x, 'b t1 t2 n c -> (b t1 t2) n c')
-        pos = rearrange(xpos, 'b t1 t2 n three -> (b t1 t2) n three').contiguous()
-        
-        x = x + self.drop_path(self.attn(self.norm1(x), pos))
-                
-        y = rearrange(y, 'b t1 t2 n c -> (b t1 t2) n c')
-        
-        qpos = rearrange(xpos, 'b t1 t2 n three -> (b t1 t2) n three').contiguous()
-        kpos = rearrange(ypos, 'b t1 t2 n three -> (b t1 t2) n three').contiguous()
-        
-        _y = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), _y, _y, qpos=qpos, kpos=kpos))
-        
-        x = rearrange(x, '(b t1 t2) n c -> (b t1 n) t2 c', t1=T1, t2=T2)
-        
-        _x = self.norm_time(x)
-        _pos = rearrange(ypos, 'b t1 t2 n three -> (b t1 n) t2 three').contiguous()
-        x = x + self.drop_path(self.ls(self.attn_time(_x, _x, _x, qpos=_pos, kpos=_pos, score_mod='causal')))
-        
-        x = x + self.drop_path(self.mlp(self.norm3(x)))
-        
-        x = rearrange(x, '(b t1 n) t2 c -> b t1 t2 n c', t1=T1, t2=T2, n=N)
-        
-        return x
-        
-    def forward_existing(self, x, y, xpos, ypos, kv_cache=None):
-        B, T1, T2, N = x.shape[:4] # T2 = ONE
-        
-        x = rearrange(x, 'b t1 t2 n c -> (b t1 t2) n c')
-        pos = rearrange(xpos, 'b t1 t2 n three -> (b t1 t2) n three')
-        
-        x = x + self.drop_path(self.attn(self.norm1(x), pos))
-                
-        y = rearrange(y, 'b t1 t2 n c -> (b t1 t2) n c')
-        
-        qpos = rearrange(xpos, 'b t1 t2 n three -> (b t1 t2) n three')
-        kpos = rearrange(ypos, 'b t1 t2 n three -> (b t1 t2) n three')
-        
-        _y = self.norm_y(y)
-        x = x + self.drop_path(self.cross_attn(self.norm2(x), _y, _y, qpos=qpos, kpos=kpos))
-        
-        x = rearrange(x, '(b t1 t2) n c -> (b t1 n) t2 c', t1=T1, t2=T2)
-        pos = rearrange(ypos, 'b t1 t2 n three -> (b t1 n) t2 three')
-        x = x + self.drop_path(self.ls(self.attn_time(self.norm_time(x), pos, kv_cache)))
-        
-        x = x + self.drop_path(self.mlp(self.norm3(x)))
-        
-        x = rearrange(x, '(b t1 n) t2 c -> b t1 t2 n c', t1=T1, t2=T2, n=N)
-        
-        return x
-        
-        # xy = rearrange(xy, '(b tq) n tk c -> b tq n tk c', tq=xtime, tk=ytime)
-        
-        # _xy = self.norm_time(xy)
-        # x = rearrange(torch.diagonal(xy, dim1=1, dim2=3), 'b n c tq -> (b tq n) 1 c')
-        
-        # _x = rearrange(torch.diagonal(_xy, dim1=1, dim2=3), 'b n c tq -> (b tq n) 1 c')
-        # _y = rearrange(_xy, 'b tq n tk c -> (b tq n) tk c')
-        # _xpos = rearrange(xpos, '(b tq) n three -> (b tq n) 1 three', tq=xtime)
-        # _ypos = repeat(ypos, '(b tk) n three -> (b tq n) tk three', tq=xtime, tk=ytime)
-        
-        # x = x + self.drop_path(self.ls(self.attn_time(_x, _y, _y, qpos=_xpos, kpos=_ypos)))
-        # x = rearrange(x, '(b tq n) 1 c -> (b tq) n c', tq=xtime, n=N)
-        
-        # return x
-        
-        # if self.return_xy:
-        #     xy = rearrange(xy, '(b tq) n tk c -> (b tq n) tk c', tq=xtime, tk=ytime)
-        #     xy_pos = repeat(ypos, '(b tk) n three -> (b tq n) tk three', tq=xtime, tk=ytime)
-            
-        #     _xy = self.norm_time(xy)
-            
-        #     xy = xy + self.drop_path(self.attn_time(_xy, _xy, _xy, xy_pos, xy_pos))
-        
-        #     xy = rearrange(xy, '(b tq n) tk c -> b tq tk n c', tq=xtime, n=N)        
-        #     xy = xy + self.drop_path(self.mlp(self.norm3(xy)))
-            
-        #     x = rearrange(torch.diagonal(xy, dim1=1, dim2=2), 'b n c tq -> (b tq) n c')
-        
-        # else:
-        #     xy = rearrange(xy, '(b tq) n tk c -> b tq n tk c', tq=xtime, tk=ytime)
-        #     _xy = self.norm_time(xy)
-        #     x = rearrange(torch.diagonal(xy, dim1=1, dim2=3), 'b n c tq -> (b tq n) 1 c')
-        #     xy = None
-            
-        #     _x = rearrange(torch.diagonal(_xy, dim1=1, dim2=3), 'b n c tq -> (b tq n) 1 c')
-        #     _y = rearrange(_xy, 'b tq n tk c -> (b tq n) tk c')
-        #     _xpos = rearrange(xpos, '(b tq) n three -> (b tq n) 1 three', tq=xtime)
-        #     _ypos = repeat(ypos, '(b tk) n three -> (b tq n) tk three', tq=xtime, tk=ytime)
-            
-        #     x = x + self.drop_path(self.ls(self.attn_time(_x, _y, _y, qpos=_xpos, kpos=_ypos)))
-        #     x = rearrange(x, '(b tq n) 1 c -> (b tq) n c', tq=xtime, n=N)
-
-        return x, xy
     
 class EncoderBlock(nn.Module):
 
@@ -330,10 +264,10 @@ class EncoderBlock(nn.Module):
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
     
-class DecoderBlockFixed(nn.Module):
+class DecoderBlock(nn.Module):
 
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0.,
-                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, norm_mem=True, rope_space=None, rope_time=None, return_xy=False):
+                 drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm, norm_mem=True, rope_space=None, rope_time=None):
         super().__init__()
         self.norm1 = norm_layer(dim)
         self.attn = Attention(dim, rope=rope_space, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
@@ -345,16 +279,14 @@ class DecoderBlockFixed(nn.Module):
 
         self.ls = LayerScale(dim)
         self.norm_time = norm_layer(dim)
-        self.attn_time = CrossAttention(dim, rope=rope_time, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
+        self.attn_time = CrossAttentionWithMask(dim, rope=rope_time, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         
         self.norm3 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         self.mlp = Mlp(in_features=dim, hidden_features=mlp_hidden_dim, act_layer=act_layer, drop=drop)
-        
-        self.return_xy = return_xy
-        
 
-    def forward(self, x, y, xpos, ypos):
+
+    def forward(self, x: torch.Tensor, y: torch.Tensor, xpos: torch.Tensor, ypos: torch.Tensor, attn_mask: torch.Tensor) -> torch.Tensor:
         B, T1, T2, N = x.shape[:4]
         
         x = rearrange(x, 'b t1 t2 n c -> (b t1 t2) n c')
@@ -375,25 +307,14 @@ class DecoderBlockFixed(nn.Module):
         _x = self.norm_time(x)
         _pos = rearrange(ypos, 'b t1 t2 n three -> (b t1 n) t2 three').contiguous()
 
-        def causal_mask(score, b_idx, h, q_idx, kv_idx):
-            batch_mask = ((kv_idx + 1) <= ((b_idx % (T1 * N)) // N))
-            qkv_mask = (q_idx >= kv_idx)
-
-            output = torch.where(torch.logical_or(batch_mask, qkv_mask), score, -float("inf"))
-
-            return output
+        x = x + self.drop_path(self.ls(self.attn_time(_x, _x, _x, qpos=_pos, kpos=_pos, attn_mask=attn_mask)))
         
-        # _score = torch.randn((B*T1*N, 12, T2, T2), device='cuda')
-        # _b_idx = torch.arange(B*T1*N, device='cuda').reshape(B*T1*N, 1, 1, 1).expand(-1, -1, T2, T2)
-        # _q_idx = torch.arange(T2, device='cuda').reshape(1, 1, T2, 1).expand(B*T1*N, -1, -1, T2)
-        # _kv_idx = torch.arange(T2, device='cuda').reshape(1, 1, 1, T2).expand(B*T1*N, -1, T2, -1)
-
-        x = x + self.drop_path(self.ls(self.attn_time(_x, _x, _x, qpos=_pos, kpos=_pos, score_mod=causal_mask)))
         x = x + self.drop_path(self.mlp(self.norm3(x)))
         x = rearrange(x, '(b t1 n) t2 c -> b t1 t2 n c', t1=T1, t2=T2, n=N)
         
         return x
 
+DecoderBlockFixed = DecoderBlock
 
 # class RepeatedAttention(nn.Module):
 
@@ -437,3 +358,49 @@ class DecoderBlockFixed(nn.Module):
 #     x = self.proj_drop(x)
     
 #     return x
+
+        # if self.cache is None:
+        #     with torch.no_grad():
+        #         _b_idx = torch.arange(B*T1*N, device='cuda').reshape(B*T1*N, 1, 1, 1).expand(-1, -1, T2, T2)
+        #         _q_idx = torch.arange(T2, device='cuda').reshape(1, 1, T2, 1).expand(B*T1*N, -1, -1, T2)
+        #         _kv_idx = torch.arange(T2, device='cuda').reshape(1, 1, 1, T2).expand(B*T1*N, -1, T2, -1)
+                
+        #         batch_mask = ((_kv_idx + 1) <= ((_b_idx % (T1 * N)) // N))
+        #         qkv_mask = (_q_idx >= _kv_idx)
+                
+        #         self.cache = torch.where(torch.logical_or(batch_mask, qkv_mask), torch.zeros_like(_q_idx), torch.ones_like(_q_idx) * -float("inf"))
+
+        # def causal_mask(score, b_idx, h, q_idx, kv_idx):
+            
+        #     batch_mask = ((kv_idx + 1) <= ((b_idx % (T1 * N)) // N))
+        #     qkv_mask = (q_idx >= kv_idx)
+            
+        #     mask = torch.where(torch.logical_or(batch_mask, qkv_mask), torch.zeros_like(q_idx), torch.ones_like(q_idx) * -float("inf"))
+        
+        #     return score + mask
+        
+        # if self.time_attention is None:
+        #     self.time_attention = torch.compile(F.scaled_dot_product_attention, fullgraph=True)
+        
+        # if self.cache.get((B, T1, N), None) is None:
+        #     with torch.no_grad():
+        #         _b_idx = torch.arange(B*T1*N, device='cuda').reshape(B*T1*N, 1, 1, 1).expand(-1, -1, T2, T2)
+        #         _q_idx = torch.arange(T2, device='cuda').reshape(1, 1, T2, 1).expand(B*T1*N, -1, -1, T2)
+        #         _kv_idx = torch.arange(T2, device='cuda').reshape(1, 1, 1, T2).expand(B*T1*N, -1, T2, -1)
+                
+        #         batch_mask = ((_kv_idx + 1) <= ((_b_idx % (T1 * N)) // N))
+        #         qkv_mask = (_q_idx >= _kv_idx)
+                
+        #         mask = torch.where(torch.logical_or(batch_mask, qkv_mask), torch.zeros_like(_q_idx), torch.ones_like(_q_idx) * -float("inf"))
+        #         mask.requires_grad = False
+        #         self.cache[(B, T1, N)] = mask
+                
+        # attn_mask = self.cache[(B, T1, N)]
+        # _attention_time = partial(F.scaled_dot_product_attention, attn_mask=attn_mask)
+        # def causal_mask(score, b_idx, h, q_idx, kv_idx):
+        #     batch_mask = ((kv_idx + 1) <= ((b_idx % (T1 * N)) // N))
+        #     qkv_mask = (q_idx >= kv_idx)
+            
+        #     return torch.where(torch.logical_or(batch_mask, qkv_mask), score, -float("inf"))
+        
+        # _flex_attention_time = torch.compile(flex_attention)

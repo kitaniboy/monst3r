@@ -1,4 +1,6 @@
 import os
+os.environ['OMP_NUM_THREADS'] = '4' # will affect the performance of pairwise prediction
+
 import math
 import cv2
 import numpy as np

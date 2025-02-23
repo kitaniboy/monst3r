@@ -17,10 +17,9 @@ from einops import rearrange, repeat
 import torch
 import torch.backends.cudnn as cudnn
 from torch.utils.tensorboard import SummaryWriter
-import croco.utils.misc as misc  # noqa
-from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler  # noqa
 
 from dust3r.datasets import get_data_loader  # noqa
+import dust3r.utils.misc as misc
 
 def _sanitize_color(color):
     # Convert tensor to list (or individual item).
@@ -224,7 +223,64 @@ def make_batch_symmetric(batch):
     view1, view2 = batch
     view1, view2 = (_interleave_imgs(view1, view2), _interleave_imgs(view2, view1))
     return view1, view2
+
+def save_on_master(*args, **kwargs):
+    if misc.is_main_process():
+        torch.save(*args, **kwargs)
+
+def save_model(args, epoch, model_without_ddp, optimizer, loss_scaler, fname=None, best_so_far=None, best_pose_ate_sofar=None):
+    output_dir = Path(args.output_dir)
+    if fname is None: fname = str(epoch)
+    checkpoint_path = output_dir / ('checkpoint-%s.pth' % fname)
+    to_save = {
+        'model': model_without_ddp.state_dict(),
+        'optimizer': optimizer.state_dict(),
+        'scaler': loss_scaler.state_dict(),
+        'args': args,
+        'epoch': epoch,
+    }
+    if best_so_far is not None: to_save['best_so_far'] = best_so_far
+    if best_pose_ate_sofar is not None: to_save['best_pose_ate_sofar'] = best_pose_ate_sofar
+    print(f'>> Saving model to {checkpoint_path} ...')
+    save_on_master(to_save, checkpoint_path)
+
+def resume_model(args, model_without_ddp, optimizer, loss_scaler):
+    args.start_epoch = 0
+    best_so_far = None
+    best_pose_ate_sofar = None
+    if args.resume is not None:
+        if args.resume.startswith('https'):
+            checkpoint = torch.hub.load_state_dict_from_url(
+                args.resume, map_location='cpu', check_hash=True)
+        else:
+            checkpoint = torch.load(args.resume, map_location='cpu', weights_only=False)
+        print("Resume checkpoint %s" % args.resume)
+        missing, unexpected = model_without_ddp.load_state_dict(checkpoint['model'], strict=False)
+        
+        if len(missing):
+            print('... missing keys:', missing)
+        
+        if len(unexpected):
+            print('... unexpected keys:', unexpected)
+        
+        args.start_epoch = checkpoint['epoch'] + 1
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        if 'scaler' in checkpoint:
+            loss_scaler.load_state_dict(checkpoint['scaler'])
+        if 'best_so_far' in checkpoint:
+            best_so_far = checkpoint['best_so_far']
+            print(" & best_so_far={:g}".format(best_so_far))
+        else:
+            print("")
+        if 'best_pose_ate_sofar' in checkpoint:
+            best_pose_ate_sofar = checkpoint['best_pose_ate_sofar']
+            print(" & best_pose_ate_sofar={:g}".format(best_pose_ate_sofar))
+        else:
+            best_pose_ate_sofar = None
+        print("With optim & sched! start_epoch={:d}".format(args.start_epoch), end='')
     
+    return best_so_far, best_pose_ate_sofar
+
 def save_final_model(args, epoch, model_without_ddp, best_so_far=None):
     output_dir = Path(args.output_dir)
     checkpoint_path = output_dir / 'checkpoint-final.pth'
@@ -236,7 +292,7 @@ def save_final_model(args, epoch, model_without_ddp, best_so_far=None):
     if best_so_far is not None:
         to_save['best_so_far'] = best_so_far
     print(f'>> Saving model to {checkpoint_path} ...')
-    misc.save_on_master(to_save, checkpoint_path)
+    save_on_master(to_save, checkpoint_path)
 
 
 def build_dataset(dataset, batch_size, num_workers, test=False):

@@ -68,6 +68,8 @@ def get_args_parser():
                         help="compile model")
     parser.add_argument("--cudnn_benchmark", action='store_true', default=False,
                         help="set cudnn.benchmark = False")
+    parser.add_argument("--empty_cache", action='store_true', default=False,
+                        help="empty cache when input size is big")
     parser.add_argument("--eval_only", action='store_true', default=False)
     parser.add_argument("--fixed_eval_set", action='store_true', default=False)
     
@@ -466,6 +468,8 @@ def train_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, 
         data_loader.sampler.set_epoch(epoch)
 
     optimizer.zero_grad()
+    if args.empty_cache: torch.cuda.empty_cache()
+    
     for data_iter_step, (views, extra_info) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
     # for data_iter_step in range(len(data_loader)):
         epoch_f = epoch + data_iter_step / len(data_loader)
@@ -479,7 +483,10 @@ def train_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, 
         camera_pose_context = torch.stack([v['camera_pose_context'] for v in views]).to(device, non_blocking=True) 
         camera_intrinsics_context = torch.stack([v['camera_intrinsics_context'] for v in views]).to(device, non_blocking=True) 
 
-        batch_size, num_views = frames_context.shape[:2]
+        batch_size, num_views, C, H, W = frames_context.shape
+        
+        if ((H * W / 256) > 680) and args.empty_cache:
+            torch.cuda.empty_cache()
         
         true_shape = torch.stack([v['true_shape_context'] for v in views])
         
@@ -533,7 +540,7 @@ def train_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, 
         
         if (data_iter_step + 1) % accum_iter == 0:
             optimizer.zero_grad()
-
+            
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value), force=True)
             sys.exit(1)
@@ -544,28 +551,28 @@ def train_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, 
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)                
 
-        if (data_iter_step + 1) % accum_iter == 0: # and ((data_iter_step + 1) % (accum_iter * args.print_freq)) == 0:
-            loss_value_reduce = misc.all_reduce_mean(loss_value)  # MUST BE EXECUTED BY ALL NODES
-            
-            if args.wandb and misc.is_main_process():
-                wandb_scalars = {
-                    'train/total_loss': loss_value_reduce,
-                    'info/lr': lr,
-                    'info/epoch': epoch_f,
-                }
-
-                for k, v in loss_details.items():
-                    wandb_scalars[f'train/{k}'] = v
+        with torch.no_grad():
+            if (data_iter_step + 1) % accum_iter == 0: # and ((data_iter_step + 1) % (accum_iter * args.print_freq)) == 0:
+                loss_value_reduce = misc.all_reduce_mean(loss_value)  # MUST BE EXECUTED BY ALL NODES
                 
-                for block_idx in range(model_without_ddp.dec_depth):
-                    with torch.no_grad():
+                if args.wandb and misc.is_main_process():
+                    wandb_scalars = {
+                        'train/total_loss': loss_value_reduce,
+                        'info/lr': lr,
+                        'info/epoch': epoch_f,
+                    }
+
+                    for k, v in loss_details.items():
+                        wandb_scalars[f'train/{k}'] = v
+                    
+                    for block_idx in range(model_without_ddp.dec_depth):
                         wandb_scalars[f'dec1/blk{block_idx:02d}/med'] = model_without_ddp.dec_blocks[block_idx].ls.gamma.data.abs().median().item()
                         wandb_scalars[f'dec2/blk{block_idx:02d}/med'] = model_without_ddp.dec_blocks2[block_idx].ls.gamma.data.abs().median().item()
                         wandb_scalars[f'dec1/blk{block_idx:02d}/max'] = model_without_ddp.dec_blocks[block_idx].ls.gamma.data.abs().max().item()
                         wandb_scalars[f'dec2/blk{block_idx:02d}/max'] = model_without_ddp.dec_blocks2[block_idx].ls.gamma.data.abs().max().item()
-                
-                # print(f"wandb step: {wandb_step}")
-                wandb.log(wandb_scalars, step=wandb_step)
+                    
+                    # print(f"wandb step: {wandb_step}")
+                    wandb.log(wandb_scalars, step=wandb_step)
 
             
             # if log_writer is not None:

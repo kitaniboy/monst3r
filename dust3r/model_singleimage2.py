@@ -180,25 +180,36 @@ class AsymmetricCroCo3DSingleImage2 (
     def _decode_path(self, x, x_embed, pos, rearrange_fn):
         f2 = f1 = rearrange_fn.repeat_tokens(x)
         pos2 = pos1 = rearrange_fn.repeat_tokens(pos)
-        pos2_swap, pos1_swap = rearrange_fn.swap_tokens(pos2), rearrange_fn.swap_tokens(pos1)
-        final_output = [(f1, f2)]
+        
+        f2_swap = rearrange_fn.swap_tokens(f2)
+        pos2_swap = rearrange_fn.swap_tokens(pos2)
+        
+        pos1 = rearrange_fn.flatten_tokens(pos1)
+        pos2_swap = rearrange_fn.flatten_tokens(pos2_swap)
+        
+        f1 = rearrange_fn.flatten_tokens(f1)
+        f2_swap = rearrange_fn.flatten_tokens(f2_swap)
+        final_output = [(f1, f2_swap)]
         
         f2 = f1 = rearrange_fn.repeat_tokens(x_embed)
-        final_output.append((f1, f2))
+        f2_swap = rearrange_fn.swap_tokens(f2)
+        
+        f1 = rearrange_fn.flatten_tokens(f1)
+        f2_swap = rearrange_fn.flatten_tokens(f2_swap)
+        final_output.append((f1, f2_swap))
         
         for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
             x, y = final_output[-1][::+1]
             # img1 side
             
-            f1 = blk1(rearrange_fn.flatten_tokens(x), rearrange_fn.flatten_tokens(rearrange_fn.swap_tokens(y)), rearrange_fn.flatten_tokens(pos1), rearrange_fn.flatten_tokens(pos2_swap))
+            f1 = blk1(x, y, pos1, pos2_swap)
             if isinstance(f1, tuple):
                 f1 = f1[0]
-            f1 = rearrange_fn.unflatten_tokens(f1)
+                
             # img2 side
-            f2 = blk2(rearrange_fn.flatten_tokens(y), rearrange_fn.flatten_tokens(rearrange_fn.swap_tokens(x)), rearrange_fn.flatten_tokens(pos2), rearrange_fn.flatten_tokens(pos1_swap))
+            f2 = blk2(y, x, pos2_swap, pos1)
             if isinstance(f2, tuple):
                 f2 = f2[0]
-            f2 = rearrange_fn.unflatten_tokens(f2)
             
             # store the result
             final_output.append((f1, f2))
@@ -305,10 +316,11 @@ class AsymmetricCroCo3DSingleImage2 (
         is_landscape = rearrange_fn.flatten_tokens(rearrange_fn.repeat_tokens(is_landscape))
         
         with torch.amp.autocast(device_type='cuda', enabled=False):
-            tok1 = [rearrange_fn.flatten_tokens(tok).float() if _idx in self.hooks_idx else None for _idx, tok in enumerate(dec1)]
-            tok2 = [rearrange_fn.flatten_tokens(tok).float() if _idx in self.hooks_idx else None for _idx, tok in enumerate(dec2)]
+            tok1 = [tok.float() if _idx in self.hooks_idx else None for _idx, tok in enumerate(dec1)]
+            tok2 = [rearrange_fn.flatten_tokens(rearrange_fn.swap_tokens(rearrange_fn.unflatten_tokens(tok))).float() if _idx in self.hooks_idx else None for _idx, tok in enumerate(dec2)]
             res1, res2 = self._head_path(tok1, tok2, (H, W), is_landscape, landscape_all, portrait_all)
         
         outputs = self._organize_output(res1, res2, idx, rearrange_fn)
+        del rearrange_fn
         
         return outputs

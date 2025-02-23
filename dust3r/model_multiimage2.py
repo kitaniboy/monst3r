@@ -173,7 +173,7 @@ class AsymmetricCroCo3DMultiImage2 (
         pos2_swap, pos1_swap = rearrange_fn.swap_tokens(pos2), rearrange_fn.swap_tokens(pos1)
         final_output = [(f1, f2)]
         
-        f2 = f1 = rearrange_fn.epeat_tokens(x_embed)
+        f2 = f1 = rearrange_fn.repeat_tokens(x_embed)
         final_output.append((f1, f2))
                 
         for blk1, blk2 in zip(self.dec_blocks, self.dec_blocks2):
@@ -310,5 +310,6 @@ class AsymmetricCroCo3DMultiImage2 (
             res1, res2 = self._head_path(tok1, tok2, (H, W), is_landscape, landscape_all, portrait_all)
             
         outputs = self._organize_output(res1, res2, idx, rearrange_fn)
+        del rearrange_fn
         
         return outputs

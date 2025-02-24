@@ -218,8 +218,6 @@ class Regr3D (Criterion, MultiLoss):
             H, W = pts1.shape[2:4]
             pts1 = pts1.reshape(-1, H, W, 3)
             
-            pts1_is_nan = pts1.isnan().any(dim=-1)
-
             gt_pts1 = einsum(R1.transpose(-1, -2), (pts1 - T1[:, None, None]), 'b i j, b h w j -> b h w i')
             
             camera_pose2 = gt2['camera_pose']
@@ -228,8 +226,6 @@ class Regr3D (Criterion, MultiLoss):
 
             pts2 = gt2['pts3d']
             pts2 = pts2.reshape(-1, H, W, 3)
-
-            pts2_is_nan = pts2.isnan().any(dim=-1)
 
             gt_pts2 = einsum(R2.transpose(-1, -2), (pts2 - T2[:, None, None]), 'b i j, b h w j -> b h w i')
         
@@ -257,20 +253,36 @@ class Regr3D (Criterion, MultiLoss):
         # normalize 3d points
         if self.norm_mode:
             pr_pts1, pr_pts2 = normalize_pointcloud(pr_pts1, pr_pts2, self.norm_mode, valid1, valid2)
-            pr_pts1[~valid1] = 0.0 
-            pr_pts2[~valid2] = 0.0
+
         if self.norm_mode and not self.gt_scale:
             gt_pts1, gt_pts2 = normalize_pointcloud(gt_pts1, gt_pts2, self.norm_mode, valid1, valid2)
-            gt_pts1[~valid1] = 0.0
-            gt_pts2[~valid2] = 0.0
-        
-        monitoring = {}
 
+        monitoring = {}
         return gt_pts1, gt_pts2, pr_pts1, pr_pts2, valid1, valid2, pr_conf1, pr_conf2, monitoring
 
     def compute_loss(self, gt1, gt2, pred1, pred2, **kw):
         gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring = \
             self.get_all_pts3d(gt1, gt2, pred1, pred2, **kw)
+        
+        # pred_pts1_is_nan = pred_pts1.isnan().any(dim=-1)
+        # pred_pts2_is_nan = pred_pts2.isnan().any(dim=-1)
+        # pred_pts1[pred_pts1_is_nan] = 0.0
+        # pred_pts2[pred_pts2_is_nan] = 0.0
+
+        # gt_pts1_is_nan = gt_pts1.isnan().any(dim=-1)
+        # gt_pts2_is_nan = gt_pts2.isnan().any(dim=-1)
+        # gt_pts1[gt_pts1_is_nan] = 0.0
+        # gt_pts2[gt_pts2_is_nan] = 0.0
+
+        # mask1 = mask1 & (~pred_pts1_is_nan & ~gt_pts1_is_nan)
+        # mask2 = mask2 & (~pred_pts2_is_nan & ~gt_pts2_is_nan)
+
+        # prevent NaN loss
+        pred_pts1[~mask1] = 0.0
+        pred_pts2[~mask2] = 0.0
+        gt_pts1[~mask1] = 0.0
+        gt_pts2[~mask2] = 0.0
+
         # loss on img1 side
         l1 = self.criterion(pred_pts1,
                             gt_pts1)

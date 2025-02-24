@@ -108,6 +108,14 @@ class AsymmetricCroCo3DMultiImage2 (
     def _set_prediction_head(self, *args, **kwargs):
         """ No prediction head """
         return
+    
+    def log_parameters(self):
+        outputs = {}
+        for block_idx in range(self.dec_depth):
+            outputs[f'dec1.blk{block_idx:02d}'] = self.dec_blocks[block_idx].ls.gamma.data
+            outputs[f'dec2.blk{block_idx:02d}'] = self.dec_blocks2[block_idx].ls.gamma.data
+            
+        return outputs
 
     def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
                             **kw):

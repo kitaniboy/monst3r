@@ -244,7 +244,6 @@ class Regr3D (Criterion, MultiLoss):
         pr_pts1 = pred1['pts3d'].reshape(-1, H, W, 3)
         pr_pts2 = pred2['pts3d_in_other_view'].reshape(-1, H, W, 3)
         
-        
         pr_conf1 = pred1['conf'].reshape(-1, H, W)
         pr_conf2 = pred2['conf'].reshape(-1, H, W)
         
@@ -265,16 +264,25 @@ class Regr3D (Criterion, MultiLoss):
         gt_pts1, gt_pts2, pred_pts1, pred_pts2, mask1, mask2, pred_conf1, pred_conf2, monitoring = \
             self.get_all_pts3d(gt1, gt2, pred1, pred2, **kw)
         # loss on img1 side
-        l1 = self.criterion(pred_pts1[mask1], gt_pts1[mask1])
+        l1 = self.criterion(pred_pts1,
+                            gt_pts1)
         # loss on gt2 side
-        l2 = self.criterion(pred_pts2[mask2], gt_pts2[mask2])
+        l2 = self.criterion(pred_pts2,
+                            gt_pts2)
         
         self_name = type(self).__name__
         loss_names = [self_name + '_pts3d_1', self_name + '_pts3d_2']
         confidences = [pred_conf1, pred_conf2]
         masks = [mask1, mask2]
         losses = [l1, l2]
-        losses_mean = [float(l1.mean()), float(l2.mean())]
+        
+        with torch.no_grad():
+            # only for printing
+            mean_weight1 = mask1.float() / mask1.sum().clamp(min=1)
+            mean_weight2 = mask2.float() / mask2.sum().clamp(min=1)
+            losses_mean = [mean_weight1.flatten() @ l1.flatten(),
+                           mean_weight2.flatten() @ l2.flatten()
+            ]
 
         # ###########################
         # gt_img1 = pred1['color_target']
@@ -372,24 +380,29 @@ class ConfLoss (MultiLoss):
         
         total_loss = 0.0
         for (loss, mask), name, conf in zip(losses_and_masks, loss_names, confidences):
-            if loss.numel() == 0:
-                print(f'NO VALID POINTS in {name}', force=True)
-                
+            float_mask = mask.float()
+            sum_mask = mask.sum()
             if conf is not None:
-                if mask is not None:
-                    conf = conf[mask]
-
                 conf, log_conf = self.get_conf_log(conf)
 
                 loss = loss * conf - self.alpha * log_conf
-                loss = loss.mean() if loss.numel() > 0 else torch.tensor(0.0, device=loss.device)
                 
-                details[f'conf_{name}'] = float(conf.mean())
+                mean_weight = float_mask / sum_mask.clamp(min=1)
+                loss = mean_weight.flatten() @ loss.flatten()
+                
+                with torch.no_grad():
+                    conf_mean = mean_weight.flatten() @ conf.flatten()
+                    details[f'conf_{name}'] = conf_mean
             else:
-                loss = loss.mean() if loss.numel() > 0 else torch.tensor(0.0, device=loss.device)
+                mean_weight = float_mask / sum_mask.clamp(min=1)
+                loss = mean_weight.flatten() @ loss.flatten()
             
-            total_loss = total_loss + loss
+            if sum_mask.item() == 0:
+                print(f'NO VALID POINTS in {name}', force=True)
 
+            total_loss = total_loss + loss
+        details['total_loss'] = total_loss
+        
         return total_loss, details
 
 class Regr3D_ShiftInv (Regr3D):

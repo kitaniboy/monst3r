@@ -118,6 +118,11 @@ class AsymmetricCroCo3DSingleImage2 (
         """ No prediction head """
         return
 
+    def log_parameters(self):
+        outputs = {}
+        
+        return outputs
+
     def set_downstream_head(self, output_mode, head_type, landscape_only, depth_mode, conf_mode, patch_size, img_size,
                             **kw):
         if type(img_size) is int:

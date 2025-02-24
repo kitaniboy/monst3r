@@ -83,10 +83,18 @@ def is_main_process():
 def all_reduce_mean(x):
     world_size = get_world_size()
     if world_size > 1:
-        x_reduce = torch.tensor(x).cuda()
-        dist.all_reduce(x_reduce)
-        x_reduce /= world_size
-        return x_reduce.item()
+        is_tensor = isinstance(x, torch.Tensor)
+        if not is_tensor:
+            x = torch.tensor(x)
+        
+        device = x.device
+        dist.all_reduce(x.cuda(), op=dist.ReduceOp.AVG)
+
+        x = x.to(device)
+        if not is_tensor:
+            x = x.item()
+
+        return x
     else:
         return x
 

@@ -92,6 +92,8 @@ def get_args_parser():
                         help='frequence (number of iterations) to print infos while training')
     parser.add_argument('--wandb', action='store_true', default=False, help='use wandb for logging')
     parser.add_argument('--num_save_visual', default=1, type=int, help='number of visualizations to save')
+    parser.add_argument('--experiment_name', type=str, help='wandb experiment group')
+    parser.add_argument('--experiment_group', type=str, help='wandb experiment group')
     
     # switch mode for train / eval pose / eval depth
     parser.add_argument('--mode', default='train', type=str, help='train / eval_pose / eval_depth')
@@ -172,10 +174,10 @@ def train(args, input_queue, output_queue):
     if args.wandb and misc.is_main_process():
         wandb_dir = os.path.join(args.output_dir, 'wandb')
         Path(wandb_dir).mkdir(parents=True, exist_ok=True)
-        wandb.init(name=args.output_dir.split('/')[-1], 
+        wandb.init(group=args.experiment_group,
+                   name=args.experiment_name, 
                    project='multi-image-2', 
                    config=args, 
-                #    sync_tensorboard=True,
                    dir=wandb_dir)
 
     # auto resume if not specified
@@ -470,8 +472,10 @@ def train_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, 
     optimizer.zero_grad()
     if args.empty_cache: torch.cuda.empty_cache()
     
+    if len(data_loader) % args.accum_iter != 0:
+        print('Warning: the number of iterations is not divisible by the accumulation factor')
+    
     for data_iter_step, (views, extra_info) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
-    # for data_iter_step in range(len(data_loader)):
         epoch_f = epoch + data_iter_step / len(data_loader)
         wandb_step = int(epoch * (len(data_loader) // accum_iter) + data_iter_step // accum_iter)
         
@@ -546,52 +550,38 @@ def train_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, 
             sys.exit(1)
         
         metric_logger.update(epoch=epoch_f)
-        metric_logger.update(total_loss=loss_value, **loss_details)
-        
         lr = optimizer.param_groups[0]["lr"]
         metric_logger.update(lr=lr)                
-
+        metric_logger.update(**loss_details)
+        
+        # send logs to wandb
         with torch.no_grad():
-            if (data_iter_step + 1) % accum_iter == 0: # and ((data_iter_step + 1) % (accum_iter * args.print_freq)) == 0:
-                loss_value_reduce = misc.all_reduce_mean(loss_value)  # MUST BE EXECUTED BY ALL NODES
+            if args.wandb and ((data_iter_step + 1) % args.print_freq == 0):
+                loss_value_reduce = {
+                    k: misc.all_reduce_mean(v) for k, v in loss_details.items()
+                }
                 
-                if args.wandb and misc.is_main_process():
+                if misc.is_main_process():
                     wandb_scalars = {
-                        'train/total_loss': loss_value_reduce,
                         'info/lr': lr,
                         'info/epoch': epoch_f,
                     }
 
-                    for k, v in loss_details.items():
+                    for k, v in loss_value_reduce.items():
                         wandb_scalars[f'train/{k}'] = v
                     
-                    for block_idx in range(model_without_ddp.dec_depth):
-                        wandb_scalars[f'dec1/blk{block_idx:02d}/med'] = model_without_ddp.dec_blocks[block_idx].ls.gamma.data.abs().median().item()
-                        wandb_scalars[f'dec2/blk{block_idx:02d}/med'] = model_without_ddp.dec_blocks2[block_idx].ls.gamma.data.abs().median().item()
-                        wandb_scalars[f'dec1/blk{block_idx:02d}/max'] = model_without_ddp.dec_blocks[block_idx].ls.gamma.data.abs().max().item()
-                        wandb_scalars[f'dec2/blk{block_idx:02d}/max'] = model_without_ddp.dec_blocks2[block_idx].ls.gamma.data.abs().max().item()
-                    
+                    parameters = model_without_ddp.log_parameters()
+                    for k, v in parameters.items():
+                        vmax = v.max().item()
+                        vmin = v.min().item()
+                        vabsmed = v.abs().median().item()
+                        wandb_scalars[f'params-max/{k}'] = vmax
+                        wandb_scalars[f'params-min/{k}'] = vmin
+                        wandb_scalars[f'params-absmed/{k}'] = vabsmed
+                        
                     # print(f"wandb step: {wandb_step}")
                     wandb.log(wandb_scalars, step=wandb_step)
-
             
-            # if log_writer is not None:
-            #     """ We use epoch_1000x as the x-axis in tensorboard.
-            #     This calibrates different curves when batch size changes.
-            #     """
-            #     epoch_1000x = int(epoch_f * 1000)
-            #     log_writer.add_scalar('train_loss', loss_value_reduce, epoch_1000x)
-            #     log_writer.add_scalar('train_lr', lr, epoch_1000x)
-            #     log_writer.add_scalar('train_iter', epoch_1000x, epoch_1000x)
-            #     for name, val in loss_details.items():
-            #         log_writer.add_scalar('train_' + name, val, epoch_1000x)
-        
-        # if (data_iter_step % max((len(data_loader) // args.num_save_visual), 1) == 0) and misc.is_main_process():
-        #     save_dir = f'{args.output_dir}/{epoch}/train'
-        #     Path(save_dir).mkdir(parents=True, exist_ok=True)
-            # save_visualizations(merged_batch, batch_result, views, save_dir, data_iter_step)
-            
-    
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
@@ -614,7 +604,6 @@ def test_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, c
         data_loader.dataset.set_epoch(epoch) if not args.fixed_eval_set else data_loader.dataset.set_epoch(0)
     if hasattr(data_loader, 'sampler') and hasattr(data_loader.sampler, 'set_epoch'):
         data_loader.sampler.set_epoch(epoch) if not args.fixed_eval_set else data_loader.sampler.set_epoch(0)
-
 
     for data_iter_step, (views, extra_info) in enumerate(metric_logger.log_every(data_loader, args.print_freq, header)):
         frames_context = torch.stack([v['frames_context'] for v in views]).to(device, non_blocking=True) 
@@ -665,15 +654,12 @@ def test_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, c
             batch_result = loss_of_one_batch(batch, labels, croco, criterion, use_amp=bool(args.amp), step=data_iter_step)
             
             loss, loss_details = batch_result['loss']
-            loss_value = float(loss)
-            # loss_value, loss_details = loss_tuple  # criterion returns two values
+            metric_logger.update(**loss_details)
 
-            metric_logger.update(total_loss=loss_value, **loss_details)
-
-        if args.num_save_visual>0 and (data_iter_step % max((len(data_loader) // args.num_save_visual), 1) == 0) and misc.is_main_process() : # save visualizations
-            save_dir = f'{args.output_dir}/{epoch}/eval'
-            Path(save_dir).mkdir(parents=True, exist_ok=True)
-            # save_visualizations(merged_batch, batch_result, views, save_dir, data_iter_step)
+        # if args.num_save_visual>0 and (data_iter_step % max((len(data_loader) // args.num_save_visual), 1) == 0) and misc.is_main_process() : # save visualizations
+        #     save_dir = f'{args.output_dir}/{epoch}/eval'
+        #     Path(save_dir).mkdir(parents=True, exist_ok=True)
+        #     # save_visualizations(merged_batch, batch_result, views, save_dir, data_iter_step)
             
 
     # gather the stats from all processes
@@ -682,10 +668,6 @@ def test_one_epoch(croco: torch.nn.Module, model_without_ddp: torch.nn.Module, c
 
     aggs = [('avg', 'global_avg'), ('med', 'median')]
     results = {f'{k}/{tag}': getattr(meter, attr) for k, meter in metric_logger.meters.items() for tag, attr in aggs}
-
-    # if log_writer is not None:
-    #     for name, val in results.items():
-    #         log_writer.add_scalar(prefix + '_' + name, val, 1000 * epoch)
 
     return results
 

@@ -47,7 +47,6 @@ class BaseCriterion(nn.Module):
         self.reduction = reduction
         self.dim = dim
 
-
 class LLoss (BaseCriterion):
     """ L-norm loss
     """
@@ -219,6 +218,8 @@ class Regr3D (Criterion, MultiLoss):
             H, W = pts1.shape[2:4]
             pts1 = pts1.reshape(-1, H, W, 3)
             
+            pts1_is_nan = pts1.isnan().any(dim=-1)
+
             gt_pts1 = einsum(R1.transpose(-1, -2), (pts1 - T1[:, None, None]), 'b i j, b h w j -> b h w i')
             
             camera_pose2 = gt2['camera_pose']
@@ -227,6 +228,9 @@ class Regr3D (Criterion, MultiLoss):
 
             pts2 = gt2['pts3d']
             pts2 = pts2.reshape(-1, H, W, 3)
+
+            pts2_is_nan = pts2.isnan().any(dim=-1)
+
             gt_pts2 = einsum(R2.transpose(-1, -2), (pts2 - T2[:, None, None]), 'b i j, b h w j -> b h w i')
         
             valid1 = gt1['valid_mask'].reshape(-1, H, W).clone()
@@ -253,9 +257,13 @@ class Regr3D (Criterion, MultiLoss):
         # normalize 3d points
         if self.norm_mode:
             pr_pts1, pr_pts2 = normalize_pointcloud(pr_pts1, pr_pts2, self.norm_mode, valid1, valid2)
+            pr_pts1[~valid1] = 0.0 
+            pr_pts2[~valid2] = 0.0
         if self.norm_mode and not self.gt_scale:
             gt_pts1, gt_pts2 = normalize_pointcloud(gt_pts1, gt_pts2, self.norm_mode, valid1, valid2)
-
+            gt_pts1[~valid1] = 0.0
+            gt_pts2[~valid2] = 0.0
+        
         monitoring = {}
 
         return gt_pts1, gt_pts2, pr_pts1, pr_pts2, valid1, valid2, pr_conf1, pr_conf2, monitoring
@@ -269,13 +277,13 @@ class Regr3D (Criterion, MultiLoss):
         # loss on gt2 side
         l2 = self.criterion(pred_pts2,
                             gt_pts2)
-        
+
         self_name = type(self).__name__
         loss_names = [self_name + '_pts3d_1', self_name + '_pts3d_2']
         confidences = [pred_conf1, pred_conf2]
         masks = [mask1, mask2]
         losses = [l1, l2]
-        
+
         with torch.no_grad():
             # only for printing
             mean_weight1 = mask1.float() / mask1.sum().clamp(min=1)
@@ -283,59 +291,6 @@ class Regr3D (Criterion, MultiLoss):
             losses_mean = [mean_weight1.flatten() @ l1.flatten(),
                            mean_weight2.flatten() @ l2.flatten()
             ]
-
-        # ###########################
-        # gt_img1 = pred1['color_target']
-        # b, c, h, w = gt_img1.shape
-        # gt_img1 = gt_img1.permute(0, 2, 3, 1)
-
-        # pred_color1 = pred1['color'].permute(0, 2, 3, 1)
-        # color_loss = self.criterion(pred_color1, gt_img1)
-        
-        # self_name = type(self).__name__
-        # loss_names.append('color_loss')
-        # confidences.append(None)
-        # masks.append(None)
-        # losses.append(color_loss)
-        # losses_mean.append(float(color_loss.mean()))
-        # ###########################
-        
-        # pred_color_in_other_view1 = pred1['color_in_other_view'].permute(0, 2, 3, 1)
-        # reduction = self.criterion.reduction
-
-        # self.criterion.reduction = 'none'
-        # with torch.no_grad():
-        #     color_other_view_loss = self.criterion(pred_color_in_other_view1, gt_img1)
-        # self.criterion.reduction = reduction
-
-        # dy_conf = rearrange(pred1['rigidity'], '(b t) (h w) 1 -> (b t) h w', t=2, h=h, w=w)
-
-        # dy_conf_loss = self.criterion(dy_conf[..., None], color_other_view_loss[..., None].detach())
-
-
-        # self_name = type(self).__name__
-        # loss_names = (self_name + '_pts3d_1', self_name + '_pts3d_2', 'color_loss', 'dy_conf_loss')
-        # confidences = (pred1['conf'], pred2['conf'], None, None)
-        # masks = (mask1, mask2, None, None)
-        # losses = (l1, l2, color_loss, dy_conf_loss)
-        # losses_mean = (float(l1.mean()), float(l2.mean()), float(color_loss.mean()), float(dy_conf_loss.mean()))
-
-
-        ###########################
-        # pred_color_in_other_view1 = pred1['color_in_other_view'].permute(0, 2, 3, 1)
-        # color_other_view_loss = self.criterion(pred_color_in_other_view1, gt_img1)
-
-        # rigidity1 = rearrange(pred1['rigidity'], '(b t) (h w) 1 -> (b t) h w', t=2, h=h, w=w)
-        # dy_conf = rigidity1
-        
-
-        # self_name = type(self).__name__
-        # loss_names = (self_name + '_pts3d_1', self_name + '_pts3d_2', 'color_loss', 'color_other_view_loss')
-        # confidences = (pred1['conf'], pred2['conf'], None, dy_conf)
-        # masks = (mask1, mask2, None, None)
-        # losses = (l1, l2, color_loss, color_other_view_loss)
-        # losses_mean = (float(l1.mean()), float(l2.mean()), float(color_loss.mean()), float(color_other_view_loss.mean()))
-        ###########################
 
         details = {}
         for loss_name, loss in zip(loss_names, losses_mean):
@@ -462,13 +417,90 @@ class Regr3D_ScaleInv (Regr3D):
 
 class Regr3D_ScaleShiftInv (Regr3D_ScaleInv, Regr3D_ShiftInv):
     # calls Regr3D_ShiftInv first, then Regr3D_ScaleInv
+    pass
     
-    def forward(self, *args, **kwargs):
-        loss, details = super().forward(*args, **kwargs)
-        
-        for key in list(details.keys()):
-            value = details[key]
-            if not isinstance(value, (float, int)):
-                details.pop(key)
+class TestLoss (MultiLoss):
+    def __init__(self, pixel_loss):
+        super().__init__()
+        self.pixel_loss = pixel_loss.with_reduction('none')
 
-        return loss, details
+    def get_name(self):
+        return f'{self.pixel_loss}'
+    
+    def compute_loss(self, gt1, gt2, pred1, pred2, **kw):
+        # compute per-pixel loss
+        # ((loss1, msk1), (loss2, msk2)), details = self.pixel_loss(gt1, gt2, pred1, pred2, **kw)
+        losses_and_masks, details = self.pixel_loss(gt1, gt2, pred1, pred2, **kw)
+
+        loss_names = details.pop('loss_names')
+        confidences = details.pop('confidences')
+        
+        total_loss = 0.0
+        for (loss, mask), name in zip(losses_and_masks, loss_names):
+            float_mask = mask.float()
+            sum_mask = mask.sum()
+
+            mean_weight = float_mask / sum_mask.clamp(min=1)
+            loss = mean_weight.flatten() @ loss.flatten()
+
+            if sum_mask.item() == 0:
+                print(f'NO VALID POINTS in {name}', force=True)
+
+            total_loss = total_loss + loss
+        details['total_loss'] = total_loss
+        
+        return total_loss, details
+    
+
+        # ###########################
+        # gt_img1 = pred1['color_target']
+        # b, c, h, w = gt_img1.shape
+        # gt_img1 = gt_img1.permute(0, 2, 3, 1)
+
+        # pred_color1 = pred1['color'].permute(0, 2, 3, 1)
+        # color_loss = self.criterion(pred_color1, gt_img1)
+        
+        # self_name = type(self).__name__
+        # loss_names.append('color_loss')
+        # confidences.append(None)
+        # masks.append(None)
+        # losses.append(color_loss)
+        # losses_mean.append(float(color_loss.mean()))
+        # ###########################
+        
+        # pred_color_in_other_view1 = pred1['color_in_other_view'].permute(0, 2, 3, 1)
+        # reduction = self.criterion.reduction
+
+        # self.criterion.reduction = 'none'
+        # with torch.no_grad():
+        #     color_other_view_loss = self.criterion(pred_color_in_other_view1, gt_img1)
+        # self.criterion.reduction = reduction
+
+        # dy_conf = rearrange(pred1['rigidity'], '(b t) (h w) 1 -> (b t) h w', t=2, h=h, w=w)
+
+        # dy_conf_loss = self.criterion(dy_conf[..., None], color_other_view_loss[..., None].detach())
+
+
+        # self_name = type(self).__name__
+        # loss_names = (self_name + '_pts3d_1', self_name + '_pts3d_2', 'color_loss', 'dy_conf_loss')
+        # confidences = (pred1['conf'], pred2['conf'], None, None)
+        # masks = (mask1, mask2, None, None)
+        # losses = (l1, l2, color_loss, dy_conf_loss)
+        # losses_mean = (float(l1.mean()), float(l2.mean()), float(color_loss.mean()), float(dy_conf_loss.mean()))
+
+
+        ###########################
+        # pred_color_in_other_view1 = pred1['color_in_other_view'].permute(0, 2, 3, 1)
+        # color_other_view_loss = self.criterion(pred_color_in_other_view1, gt_img1)
+
+        # rigidity1 = rearrange(pred1['rigidity'], '(b t) (h w) 1 -> (b t) h w', t=2, h=h, w=w)
+        # dy_conf = rigidity1
+        
+
+        # self_name = type(self).__name__
+        # loss_names = (self_name + '_pts3d_1', self_name + '_pts3d_2', 'color_loss', 'color_other_view_loss')
+        # confidences = (pred1['conf'], pred2['conf'], None, dy_conf)
+        # masks = (mask1, mask2, None, None)
+        # losses = (l1, l2, color_loss, color_other_view_loss)
+        # losses_mean = (float(l1.mean()), float(l2.mean()), float(color_loss.mean()), float(color_other_view_loss.mean()))
+        ###########################

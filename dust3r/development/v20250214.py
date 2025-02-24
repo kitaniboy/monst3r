@@ -71,6 +71,7 @@ def get_args_parser():
     parser.add_argument("--empty_cache", action='store_true', default=False,
                         help="empty cache when input size is big")
     parser.add_argument("--eval_only", action='store_true', default=False)
+    parser.add_argument("--eval_first", action='store_true', default=False)
     parser.add_argument("--fixed_eval_set", action='store_true', default=False)
     
     parser.add_argument('--resume', default=None, type=str, help='path to latest checkpoint (default: none)')
@@ -314,7 +315,7 @@ def train(args, input_queue, output_queue):
         new_best = False
         new_pose_best = False
         
-        if (epoch > args.start_epoch and args.eval_freq > 0 and epoch % args.eval_freq == 0) or args.eval_only:
+        if (epoch == args.start_epoch and args.eval_first) or (epoch > args.start_epoch and args.eval_freq > 0 and epoch % args.eval_freq == 0) or args.eval_only:
             # if epoch > args.start_epoch:
             #     if args.save_freq and epoch % args.save_freq == 0 or epoch == args.epochs and not already_saved:
             #         save_model(epoch - 1, 'before_eval')

@@ -176,7 +176,7 @@ def train(args, input_queue, output_queue):
         Path(wandb_dir).mkdir(parents=True, exist_ok=True)
         wandb.init(group=args.experiment_group,
                    name=args.experiment_name, 
-                   project='multi-image-2', 
+                   project='multi-image-2-new', 
                    config=args, 
                    dir=wandb_dir)
 

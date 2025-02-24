@@ -382,11 +382,11 @@ class ConfLoss (MultiLoss):
                 conf, log_conf = self.get_conf_log(conf)
 
                 loss = loss * conf - self.alpha * log_conf
-                loss = loss.mean() if loss.numel() > 0 else 0
+                loss = loss.mean() if loss.numel() > 0 else torch.tensor(0.0, device=loss.device)
                 
                 details[f'conf_{name}'] = float(conf.mean())
             else:
-                loss = loss.mean() if loss.numel() > 0 else 0
+                loss = loss.mean() if loss.numel() > 0 else torch.tensor(0.0, device=loss.device)
             
             total_loss = total_loss + loss
 

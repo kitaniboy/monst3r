@@ -10,8 +10,8 @@ scipy
 einops
 gdown
 trimesh
-pyglet<2
-huggingface-hub[torch]>=0.22
+pyglet
+huggingface-hub[torch]
 
 # for camera trajectory
 evo

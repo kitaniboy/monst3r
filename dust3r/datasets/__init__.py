@@ -16,6 +16,13 @@ from .sintel import SintelDUSt3R  # noqa
 from .tartanair import TarTanAirDUSt3R  # noqa
 from .spring_dataset import SpringDUSt3R  # noqa
 from .dynamic_replica import DynamicReplicaDUSt3R  # noqa
+from .hypernerf import Hypernerf  # noqa
+from .iphone import Iphone  # noqa
+from .re10k import Re10kDUSt3R  # noqa
+
+from .pointodyssey_lmdb import PointOdysseyLMDB
+from .tartanair_lmdb import TarTanAirLMDB
+from .spring_dataset_lmdb import SpringLMDB
 
 def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=True, pin_mem=True):
     import torch
@@ -51,6 +58,7 @@ def get_data_loader(dataset, batch_size, num_workers=8, shuffle=True, drop_last=
         num_workers=num_workers,
         pin_memory=pin_mem,
         drop_last=drop_last,
+        collate_fn=dataset.collate_fn,
     )
 
     return data_loader
